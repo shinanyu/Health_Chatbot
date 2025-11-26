@@ -1,0 +1,11 @@
+                     precision    recall  f1-score   support
+
+barbell biceps curl     1.0000    1.0000    1.0000         4
+        hammer curl     1.0000    0.6667    0.8000         3
+            push-up     1.0000    1.0000    1.0000         3
+     shoulder press     0.8000    1.0000    0.8889         4
+              squat     0.7500    0.7500    0.7500         4
+
+           accuracy                         0.8889        18
+          macro avg     0.9100    0.8833    0.8878        18
+       weighted avg     0.9000    0.8889    0.8864        18
