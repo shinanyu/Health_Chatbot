@@ -136,7 +136,7 @@ def extract_pose_features(bgr_img, last_state: Optional[Dict[str, Any]] = None) 
     def xy(i):  # normalize -> pixel
         return (lm[i].x * w, lm[i].y * h)
 
-    # 주요 포인트 (.value 중요)
+    # 주요 포인트 (.value 중요) : mediapipe로 키포인트 뽑아냄
     L_SH, R_SH = xy(mp_pose.PoseLandmark.LEFT_SHOULDER.value), xy(mp_pose.PoseLandmark.RIGHT_SHOULDER.value)
     L_EL, R_EL = xy(mp_pose.PoseLandmark.LEFT_ELBOW.value),    xy(mp_pose.PoseLandmark.RIGHT_ELBOW.value)
     L_WR, R_WR = xy(mp_pose.PoseLandmark.LEFT_WRIST.value),    xy(mp_pose.PoseLandmark.RIGHT_WRIST.value)
@@ -144,20 +144,20 @@ def extract_pose_features(bgr_img, last_state: Optional[Dict[str, Any]] = None) 
     L_KN, R_KN = xy(mp_pose.PoseLandmark.LEFT_KNEE.value),     xy(mp_pose.PoseLandmark.RIGHT_KNEE.value)
     L_AN, R_AN = xy(mp_pose.PoseLandmark.LEFT_ANKLE.value),    xy(mp_pose.PoseLandmark.RIGHT_ANKLE.value)
 
-    # 중앙점
+    # 중앙점(keypoints) : post_data, 키포인트 활용해 중앙점 수치 구하고
     SHO = ((L_SH[0] + R_SH[0]) / 2, (L_SH[1] + R_SH[1]) / 2)
     HIP = ((L_HI[0] + R_HI[0]) / 2, (L_HI[1] + R_HI[1]) / 2)
     KNE = ((L_KN[0] + R_KN[0]) / 2, (L_KN[1] + R_KN[1]) / 2)
     ANK = ((L_AN[0] + R_AN[0]) / 2, (L_AN[1] + R_AN[1]) / 2)
 
-    # 각도
+    # 각도(joints) : pose_data
     elbow_left = angle_3pts(L_SH, L_EL, L_WR)
     elbow_right = angle_3pts(R_SH, R_EL, R_WR)
     knee_left = angle_3pts(L_HI, L_KN, L_AN)
     knee_right = angle_3pts(R_HI, R_KN, R_AN)
-    back_angle = angle_3pts(SHO, HIP, KNE)  # 몸통 기울기 대략
+    back_angle = angle_3pts(SHO, HIP, KNE)  # 몸통 기울기 대략 : 위에서 구한 중앙점 수치 활용함
 
-    # 거리/비율
+    # 거리/비율(distances) : pose_data
     shoulder_hip = dist(SHO, HIP)
     hip_knee = dist(HIP, KNE)
     knee_ankle = dist(KNE, ANK)
@@ -300,7 +300,8 @@ def analyze_frame(image_bytes: bytes) -> Dict[str, Any]:
 # 운동 시퀀스 분석 (rep 분할/ROM/대칭/정렬/흔들림)
 # ============================================================
 
-# MediaPipe Pose 인덱스 (33개 랜드마크 기준)
+# MediaPipe Pose 인덱스 (33개 랜드마크 기준) : 표준 index를 정의 (33개 관절좌표에는 각각 mediapipe에서 정의된 
+# 고정 index번호가 있음)
 NOSE = 0
 L_SHOULDER = 11
 R_SHOULDER = 12
@@ -829,7 +830,6 @@ def on_shutdown():
     except Exception:
         pass
 
-
 # ============================================================
 # 헬스 체크용 엔드포인트
 # ============================================================
@@ -837,28 +837,14 @@ def on_shutdown():
 def root():
     return "OK"
 
-
-@app.get("/health")
-def health():
-    return {"status": "AI Core running"}
-
-
-# ============================================================
 # 메인 엔드포인트: /analyze
-#   - 이미지 / 비디오 / 텍스트 입력을 처리
-#   - 내부에서 CNN-LSTM + MediaPipe로 분석
-#   - 분석 JSON을 LLM 서버에 보내서 코칭 문장을 받아온 뒤 반환
+#   - 이미지 / 비디오 / 텍스트 입력을 처리 
+#   - 내부에서 CNN-LSTM + MediaPipe로 분석 
+#   - 분석 결과를 spirngboot프록시 서버로 반환 
 # ============================================================
 @app.post("/analyze")
 def analyze_json(payload: AnalyzeRequest):
-    """
-    1) image(base64)  → 단일 프레임 분석 (폼 + 간단 분류)
-    2) video(base64)  → 시퀀스 분석 (rep, ROM, 템포, 대칭, 흔들림 등)
-    3) message(text)  → 텍스트만 LLM에 넘기고 싶을 때
 
-    → 모든 경우에 대해 LLM 서버에 분석 결과를 함께 보내고,
-      LLM이 생성한 코칭 답변과 분석 JSON을 프론트로 반환.
-    """
     try:
         msg = (payload.message or "").strip()
 
@@ -895,49 +881,7 @@ def analyze_json(payload: AnalyzeRequest):
         else:
             raise HTTPException(status_code=400, detail="image, video, message 중 하나 필요")
 
-        # ========== LLM 서버로 전달할 payload 구성 ==========
-        send_data = {
-            "user_id": payload.userId,
-            "message": msg if msg else "",
-            "analysis": analysis_out,   # 운동 분석 JSON 전체
-        }
-
-        # ========== LLM 서버 호출 ==========
-        # 현재는 로컬 7000포트 기준. 필요하면 환경변수나 설정파일로 빼도 됨.
-        try:
-            print("[DEBUG] send_data:", send_data)
-            
-            import json
-            try:
-                json.dumps(send_data)
-            except Exception as e:
-                print("[ERROR] JSON serialize fail:", e)
-                raise
-            
-            res = requests.post(
-                "http://localhost:7000/chat_with_analysis",
-                json=send_data,
-                timeout=120,
-            )
-        except requests.RequestException as e:
-            print("[ERROR] LLM 요청 단계에서 터짐:", str(e))
-            raise HTTPException(status_code=500, detail=f"LLM 서버 연결 실패: {str(e)}")
-
-        if res.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail=f"LLM 서버 응답 실패 (status={res.status_code})",
-            )
-
-        llm_answer = res.json().get("answer", "")
-        
-        # ========== 최종 응답 ==========
-        # 프론트에서는 answer를 채팅 메시지로, analysis를 상세 분석 데이터로 사용
-        return {"answer": llm_answer, "analysis": analysis_out}
-
-    except HTTPException:
-        # 이미 의미 있는 HTTP 오류를 만든 경우 그대로 전달
-        raise
+        return {"analysis": analysis_out}
     except Exception as e:
         import traceback
 
