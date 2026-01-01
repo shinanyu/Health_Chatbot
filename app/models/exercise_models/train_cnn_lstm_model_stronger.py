@@ -234,9 +234,8 @@ def oversample_train(X, y, target="max", random_state=42):
     rng.shuffle(new_indices)
 
     return X[new_indices].tolist(), y[new_indices]
-# =========================
+
 # Temporal Attention Layer
-# =========================
 class TemporalAttention(layers.Layer):
     def __init__(self, units=128, **kwargs):
         super().__init__(**kwargs)
@@ -250,9 +249,7 @@ class TemporalAttention(layers.Layer):
         context = tf.reduce_sum(a * x, axis=1)
         return context
 
-# =========================
 # 모델 빌드
-# =========================
 def build_cnn_lstm_attention(frame_shape=(160,160,3), seq_len=24, num_classes=5, backbone="EfficientNetB0"):
     if backbone == "EfficientNetB0":
         cnn = tf.keras.applications.EfficientNetB0(include_top=False, input_shape=frame_shape, pooling="avg")
