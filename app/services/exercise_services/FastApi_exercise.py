@@ -867,14 +867,6 @@ def analyze_json(payload: AnalyzeRequest):
         # 3) 텍스트만 있을 때
         elif msg:
             analysis_out = {
-                "detected_exercise": None,
-                "exercise_confidence": None,
-                "probs": None,
-                "total_frames": None,
-                "frames": None,
-                "stage": None,
-                "pose_detected": None,
-                "pose_data": None,
                 "message": msg,
             }
 

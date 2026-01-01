@@ -8,6 +8,109 @@ from llama_cpp import Llama
 import numpy as np
 import re
 
+from pymongo import MongoClient
+from sentence_transformers import SentenceTransformer
+from datetime import datetime
+
+# ===== MongoDB =====
+client = MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=500)
+db = client["ai_coach"]
+chat_col = db["chat_history"]
+
+# ===== 임베딩 모델 =====
+EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
+embed_model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+
+# 임베딩 함수
+# def embed(text: str) -> List[float]:
+#     # e5 계열은 보통 "query: " / "passage: " prefix 쓰지만,
+#     # 간단하게는 그냥 text만 넣어도 동작함.
+#     return embed_model.encode(text, normalize_embeddings=True).tolist()
+
+def embed(text: str, mode: str = "passage") -> List[float]:
+    """
+    mode = "query"  -> 검색 쿼리용 임베딩
+    mode = "passage" -> 문서(저장용) 임베딩
+    """
+    if mode == "query":
+        prefix = "query: "
+    else:
+        prefix = "passage: "
+    return embed_model.encode(prefix + text, normalize_embeddings=True).tolist()
+
+# 큐앤에이 저장 함수
+def save_qna_to_mongo(user_id: str, question: str, answer: str):
+    """
+    사용자 질문 + LLM 답변을 하나의 문서로 묶어서 임베딩 후 MongoDB에 저장
+    """
+    doc_text = f"질문: {question}\n답변: {answer}"
+    vec = embed(doc_text, mode="passage")
+
+    qna_doc = {
+        "user_id": user_id,
+        "text": doc_text,
+        "embedding": vec,
+        "created_at": datetime.utcnow(),
+    }
+    chat_col.insert_one(qna_doc)
+
+# 대화 내용 코사인 유사도 검색 함수 (mongodb벡터 검색 기능 사용x)
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    if b.ndim == 1:
+        b = b.reshape(1, -1)
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
+    return float(np.dot(a_norm, b_norm.T)[0][0])
+
+# 이전 q&a 프롬프트에 넣는 함수
+def format_memory_block(docs: List[Dict[str, Any]]) -> str:
+    """
+    검색된 Q&A들을 LLM에게 보여줄 수 있는 텍스트 블록으로 변환.
+    너무 길어지지 않게 적당히 자름.
+    """
+    if not docs:
+        return ""
+
+    lines = ["[이전에 이 사용자에게 제공했던 관련 조언 일부]"]
+    for i, doc in enumerate(docs, start=1):
+        text = doc.get("text", "")
+        # 너무 길면 앞부분만 사용
+        text = text[:500]
+        lines.append(f"\n(Q&A #{i})\n{text}")
+
+    return "\n".join(lines)
+
+def retrieve_similar_qna(user_id: str, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """
+    새 질문(query)에 대해, 같은 user_id의 과거 Q&A 중 상위 top_k개를 찾아옴
+    (간단하게 전체 스캔 + 파이썬에서 코사인 유사도 정렬)
+    """
+    query_vec = np.array(embed(query, mode="query"), dtype=np.float32)
+
+    # 일단 최근 N개만 제한해서 가져오기 (예: 200개)
+    cursor = chat_col.find({"user_id": user_id}).sort("created_at", -1).limit(200)
+
+    scored = []
+    for doc in cursor:
+        emb = doc.get("embedding")
+        if not emb:
+            continue
+        emb_vec = np.array(emb, dtype=np.float32)
+        sim = cosine_sim(query_vec, emb_vec)
+        scored.append((sim, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    
+    # 디버깅
+    for sim, doc in scored[:5]:
+        print(f"[RAG DEBUG] sim={sim:.3f}, text={doc.get('text','')[:80]}")
+    
+    top_docs = [d for (s, d) in scored[:top_k] if s > 0.2]  # 유사도 threshold는 대충 0.3 정도
+
+    return top_docs
+
 # ----------------------------------------
 # FastAPI 설정
 # ----------------------------------------
@@ -33,8 +136,8 @@ llm = Llama(
     model_path=MODEL_PATH,
     n_ctx=2048,
     n_threads=8,
-    repeat_penalty=1.3,      # repeat_penalty는 1.2~1.4 권장 : 1.25~1.3은 “방금 쓴 문장 반복 금지 효과” 
-    repeat_last_n=256,       # 반복 억제
+    repeat_penalty=1.5,      # repeat_penalty는 1.2~1.4 권장 : 1.25~1.3은 “방금 쓴 문장 반복 금지 효과” 
+    repeat_last_n=512,       # 반복 억제
 )
 
 BAD_PHRASES = [
@@ -232,14 +335,45 @@ BASE_SYSTEM_PROMPT = """
 17. "개선이 필요한 점"과 "부상 위험 요소"에 같은 내용을 두 번 쓰지 않습니다.
 """
 
-
-def build_prompt(summary: str, user_msg: str) -> str:
+def build_prompt(summary: str, user_msg: str, memory_block: str = "") -> str:
     print(summary)
+
+    is_summary_available = not summary.startswith("[운동 분석 정보 없음]")
+
+    # 🔹 1) 운동 분석 정보 없을 경우 → 일반 대화 모드
+    if not is_summary_available:
+        return f"""너는 친절한 한국인 운동 코치야.
+[이전에 이 사용자에게 했던 조언 (없으면 비어 있을 수 있음)]
+{memory_block if memory_block else "(이전에 저장된 조언이 없습니다.)"}
+
+[지침]
+- 위 블록에 사용자의 과거 운동이나 조언 내용이 있다면, 그것을 우선 참고해서 이 사용자에게 맞춰서 답변한다.
+- 특히, 사용자가 "전에", "예전에", "지난번에", "그때"처럼 과거 운동이나 과거 조언을 물어보는 경우:
+  - 위 블록에 관련 내용이 있으면, 그 내용을 근거로 "전에 ~ 운동을 했었다"처럼 요약해서 알려준다.
+  - 위 블록에 관련 내용이 없으면, "저장된 기록만으로는 예전에 어떤 운동을 하셨는지 정확히 알기 어렵습니다."라고 솔직하게 말한다.
+  - 이때 과거에 하지 않았던 운동이나 기록에 없는 내용은 절대 지어내지 않는다.
+- 사용자가 앞으로 어떤 운동을 하면 좋을지, 운동 팁/계획/추천을 물어보는 경우에는,
+  - 개인 기록이 있으면 그것을 참고해서 개인화된 조언을 하고,
+  - 개인 기록이 부족하면 일반적인 운동 상식 수준에서 조언해도 된다.
+- 답변은 1~2문장으로 짧게, 예시 대화나 새로운 질문을 만들지 말고, 지금 질문에 대한 답변만 작성한다.
+
+[사용자 질문]
+{user_msg}
+
+[최종 답변만 작성하세요]
+"""
+
+    # 2) 운동 분석 정보 있을 경우 → 기존 운동 피드백 모드
+    memory_section = ""
+    if memory_block:
+        memory_section = f"\n{memory_block}\n"
+
     return f"""{BASE_SYSTEM_PROMPT}
 
 [운동 분석 요약]
 {summary}
 
+{memory_section}
 [사용자 질문]
 {user_msg}
 
@@ -267,7 +401,6 @@ def build_prompt(summary: str, user_msg: str) -> str:
 - 
 """
 
-
 # ----------------------------------------
 # 최종 엔드포인트 : /chat_with_analysis
 #   main.py 의 /analyze → LLM 서버 호출 구조와 1:1 매칭
@@ -288,11 +421,15 @@ async def chat_with_analysis(req: ChatWithAnalysisRequest):
 
     # 1. JSON → 요약 텍스트
     summary_text = summarize_exercise_json(req.analysis)
+    
+    # 2. 과거 Q&A RAG 검색
+    similar_docs = retrieve_similar_qna(user_id=req.user_id, query=req.message, top_k=3)
+    memory_block = format_memory_block(similar_docs)
+    
+    # 3. 프롬프트 구성
+    prompt = build_prompt(summary_text, req.message, memory_block=memory_block)
 
-    # 2. 프롬프트 구성
-    prompt = build_prompt(summary_text, req.message)
-
-    # 3. LLM 호출
+    # 4. LLM 호출 
     result = llm(
         prompt,
         max_tokens=512,
@@ -308,6 +445,17 @@ async def chat_with_analysis(req: ChatWithAnalysisRequest):
     )
     raw_text = result["choices"][0]["text"]
     answer_text = clean_answer(raw_text)
+    
+    # 5. 이번 Q&A를 MongoDB + 임베딩으로 저장 (RAG 지식 추가)
+    try:
+        save_qna_to_mongo(
+            user_id=req.user_id,
+            question=req.message,
+            answer=answer_text,
+        )
+    except Exception as e:
+        # 로그만 찍고, 사용자에게는 영향 없게
+        print(f"[WARN] failed to save QnA to MongoDB: {e}")
 
     # 4. 응답 반환
     return ChatWithAnalysisResponse(
